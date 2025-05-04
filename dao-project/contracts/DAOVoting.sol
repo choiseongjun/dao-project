@@ -1,124 +1,131 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract DAOVoting is Ownable {
+    IERC20 public immutable votingToken;
+    uint256 public immutable minVotingPower;
+    
+    // 가스 최적화: 구조체 단순화 및 패킹
     struct Proposal {
-        uint256 id;
-        string title;
-        string description;
-        uint256 startTime;
-        uint256 endTime;
-        uint256 yesVotes;
-        uint256 noVotes;
+        bytes32 title;
+        uint32 startTime;
+        uint32 endTime;
+        uint32 yesVotes;
+        uint32 noVotes;
         bool executed;
-        mapping(address => bool) hasVoted;
     }
 
-    IERC20 public votingToken;
-    uint256 public minVotingPower;
-    mapping(uint256 => Proposal) public proposals;
-    uint256 public proposalCount;
-    
-    // 보상 관련 변수 추가
-    uint256 public constant REWARD_AMOUNT = 0.1 * 10**18; // 0.1 토큰 (18 decimals)
-    mapping(address => uint256) public userRewards;
-
-    event ProposalCreated(uint256 indexed proposalId, string title, string description);
-    event Voted(uint256 indexed proposalId, address voter, bool support);
-    event ProposalExecuted(uint256 indexed proposalId);
-    event RewardDistributed(address indexed user, uint256 amount);
+    // 가스 최적화: 이벤트 최소화 및 indexed 필드 최적화
+    event ProposalCreated(uint256 indexed id, bytes32 title);
+    event Voted(uint256 indexed id, address indexed voter, bool support);
+    event ProposalExecuted(uint256 indexed id);
     event RewardsClaimed(address indexed user, uint256 amount);
+
+    // 가스 최적화: 매핑 통합 및 패킹
+    mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    mapping(uint256 => mapping(address => bool)) public voteSupport; // 투표 방향 저장
+    mapping(address => uint256) public rewards;
+
+    uint256 public proposalCount;
+    uint256 private constant REWARD = 0.1 ether;
+    uint256 private constant VOTING_PERIOD = 7 days;
 
     constructor(address _votingToken, uint256 _minVotingPower) Ownable(msg.sender) {
         votingToken = IERC20(_votingToken);
         minVotingPower = _minVotingPower;
     }
 
-    function createProposal(string memory _title, string memory _description) public {
-        Proposal storage newProposal = proposals[proposalCount];
-        newProposal.id = proposalCount;
-        newProposal.title = _title;
-        newProposal.description = _description;
-        newProposal.startTime = block.timestamp;
-        newProposal.endTime = block.timestamp + 7 days;
-        newProposal.yesVotes = 0;
-        newProposal.noVotes = 0;
-        newProposal.executed = false;
-
-        emit ProposalCreated(proposalCount, _title, _description);
-        proposalCount++;
+    // 가스 최적화: calldata 사용 및 불필요한 검사 제거
+    function createProposal(string calldata _title) external {
+        require(bytes(_title).length <= 32, "Title too long");
+        
+        uint256 id = proposalCount++;
+        Proposal storage p = proposals[id];
+        
+        p.title = bytes32(bytes(_title));
+        p.startTime = uint32(block.timestamp);
+        p.endTime = uint32(block.timestamp + VOTING_PERIOD);
+        
+        emit ProposalCreated(id, p.title);
     }
 
-    function vote(uint256 _proposalId, bool _support) public {
-        require(_proposalId < proposalCount, "Invalid proposal ID");
-        require(!proposals[_proposalId].executed, "Proposal already executed");
-        require(!proposals[_proposalId].hasVoted[msg.sender], "Already voted");
-        require(block.timestamp >= proposals[_proposalId].startTime && 
-                block.timestamp <= proposals[_proposalId].endTime, 
-                "Voting period is not active");
-        
-        // 투표자 토큰 잔액 확인
-        require(votingToken.balanceOf(msg.sender) >= minVotingPower, "Insufficient voting power");
+    // 가스 최적화: 조건문 최적화 및 불필요한 검사 제거
+    function vote(uint256 _id, bool _support) external {
+        Proposal storage p = proposals[_id];
+        require(!p.executed, "Proposal executed");
+        require(block.timestamp >= p.startTime && block.timestamp <= p.endTime, "Not active");
+        require(votingToken.balanceOf(msg.sender) >= minVotingPower, "Insufficient power");
 
-        if (_support) {
-            proposals[_proposalId].yesVotes++;
-        } else {
-            proposals[_proposalId].noVotes++;
+        if (hasVoted[_id][msg.sender]) {
+            // 이전 투표 취소
+            if (voteSupport[_id][msg.sender]) {
+                p.yesVotes--;
+            } else {
+                p.noVotes--;
+            }
+            rewards[msg.sender] -= REWARD;
         }
+
+        // 새 투표
+        hasVoted[_id][msg.sender] = true;
+        voteSupport[_id][msg.sender] = _support;
+        if (_support) p.yesVotes++; else p.noVotes++;
         
-        proposals[_proposalId].hasVoted[msg.sender] = true;
-        
-        // 투표 보상 지급
-        userRewards[msg.sender] += REWARD_AMOUNT;
-        
-        emit Voted(_proposalId, msg.sender, _support);
-        emit RewardDistributed(msg.sender, REWARD_AMOUNT);
+        rewards[msg.sender] += REWARD;
+        emit Voted(_id, msg.sender, _support);
     }
 
-    // 보상 청구 함수 추가
-    function claimRewards() public {
-        uint256 reward = userRewards[msg.sender];
-        require(reward > 0, "No rewards to claim");
-        
-        userRewards[msg.sender] = 0;
-        require(votingToken.transfer(msg.sender, reward), "Reward transfer failed");
-        
-        emit RewardsClaimed(msg.sender, reward);
+    // 투표 취소 함수 추가
+    function cancelVote(uint256 _id) external {
+        Proposal storage p = proposals[_id];
+        require(hasVoted[_id][msg.sender], "No vote to cancel");
+        require(!p.executed, "Proposal executed");
+        require(block.timestamp <= p.endTime, "Voting ended");
+
+        hasVoted[_id][msg.sender] = false;
+        if (voteSupport[_id][msg.sender]) {
+            p.yesVotes--;
+        } else {
+            p.noVotes--;
+        }
+        rewards[msg.sender] -= REWARD;
+        emit Voted(_id, msg.sender, false); // 취소 이벤트 발생
     }
 
-    function executeProposal(uint256 _proposalId) public {
-        require(_proposalId < proposalCount, "Invalid proposal ID");
-        require(!proposals[_proposalId].executed, "Proposal already executed");
-        require(block.timestamp > proposals[_proposalId].endTime, "Voting period not ended");
+    // 가스 최적화: 불필요한 검사 제거
+    function claimRewards() external {
+        uint256 amount = rewards[msg.sender];
+        require(amount > 0, "No rewards");
         
-        proposals[_proposalId].executed = true;
-        emit ProposalExecuted(_proposalId);
+        rewards[msg.sender] = 0;
+        require(votingToken.transfer(msg.sender, amount), "Transfer failed");
+        
+        emit RewardsClaimed(msg.sender, amount);
     }
 
-    function getProposal(uint256 _proposalId) public view returns (
-        uint256 id,
-        string memory title,
-        string memory description,
-        uint256 startTime,
-        uint256 endTime,
-        uint256 yesVotes,
-        uint256 noVotes,
+    // 가스 최적화: 조건문 최적화
+    function executeProposal(uint256 _id) external {
+        Proposal storage p = proposals[_id];
+        require(!p.executed && block.timestamp > p.endTime, "Cannot execute");
+        
+        p.executed = true;
+        emit ProposalExecuted(_id);
+    }
+
+    // 가스 최적화: view 함수 최적화
+    function getProposal(uint256 _id) external view returns (
+        bytes32 title,
+        uint32 startTime,
+        uint32 endTime,
+        uint32 yesVotes,
+        uint32 noVotes,
         bool executed
     ) {
-        require(_proposalId < proposalCount, "Invalid proposal ID");
-        Proposal storage proposal = proposals[_proposalId];
-        return (
-            proposal.id,
-            proposal.title,
-            proposal.description,
-            proposal.startTime,
-            proposal.endTime,
-            proposal.yesVotes,
-            proposal.noVotes,
-            proposal.executed
-        );
+        Proposal storage p = proposals[_id];
+        return (p.title, p.startTime, p.endTime, p.yesVotes, p.noVotes, p.executed);
     }
 } 
