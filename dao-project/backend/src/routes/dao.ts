@@ -104,9 +104,17 @@ router.post("/claim-rewards", async (req, res) => {
       success: true,
       transactionHash: receipt.transactionHash,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error claiming rewards:", error);
-    res.status(500).json({ error: "Failed to claim rewards" });
+    if (error.message.includes("No rewards")) {
+      return res.status(400).json({
+        error:
+          "You have no rewards to claim. Please vote first to earn rewards.",
+      });
+    }
+    res
+      .status(500)
+      .json({ error: "Failed to claim rewards. Please try again later." });
   }
 });
 
@@ -135,6 +143,56 @@ router.get("/proposals", async (req, res) => {
   } catch (error) {
     console.error("Error fetching proposals:", error);
     res.status(500).json({ error: "Failed to fetch proposals" });
+  }
+});
+
+// 보상 청구 기록 조회
+router.get("/reward-history", async (req, res) => {
+  try {
+    const rewardFilter = daoContract.filters.RewardsClaimed();
+    const events = await daoContract.queryFilter(rewardFilter);
+
+    const history = await Promise.all(
+      events.map(async (event) => {
+        const block = await event.getBlock();
+        return {
+          user: event.args?.user,
+          amount: ethers.utils.formatEther(event.args?.amount),
+          timestamp: block.timestamp,
+        };
+      })
+    );
+
+    res.json(history);
+  } catch (error) {
+    console.error("Error fetching reward history:", error);
+    res.status(500).json({ error: "Failed to fetch reward history" });
+  }
+});
+
+// 사용자의 투표 내역 조회
+router.get("/vote-history", async (req, res) => {
+  try {
+    const voteFilter = daoContract.filters.Voted();
+    const events = await daoContract.queryFilter(voteFilter);
+
+    const history = await Promise.all(
+      events.map(async (event) => {
+        const block = await event.getBlock();
+        const proposal = await daoContract.getProposal(event.args?.id);
+        return {
+          proposalId: event.args?.id,
+          title: ethers.utils.parseBytes32String(proposal.title),
+          support: event.args?.support,
+          timestamp: block.timestamp,
+        };
+      })
+    );
+
+    res.json(history);
+  } catch (error) {
+    console.error("Error fetching vote history:", error);
+    res.status(500).json({ error: "Failed to fetch vote history" });
   }
 });
 
