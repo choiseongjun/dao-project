@@ -176,20 +176,54 @@ router.get("/vote-history", async (req, res) => {
     const voteFilter = daoContract.filters.Voted();
     const events = await daoContract.queryFilter(voteFilter);
 
-    const history = await Promise.all(
+    // 모든 투표 이벤트를 가져와서 처리
+    const allVotes = await Promise.all(
       events.map(async (event) => {
-        const block = await event.getBlock();
         const proposal = await daoContract.getProposal(event.args?.id);
         return {
           proposalId: event.args?.id,
           title: ethers.utils.parseBytes32String(proposal.title),
           support: event.args?.support,
-          timestamp: block.timestamp,
+          timestamp: (await event.getBlock()).timestamp,
+          blockNumber: event.blockNumber,
+          transactionHash: event.transactionHash,
         };
       })
     );
 
-    res.json(history);
+    // 제안별로 그룹화
+    const groupedVotes = allVotes.reduce<Record<number, typeof allVotes>>(
+      (acc, vote) => {
+        if (!acc[vote.proposalId]) {
+          acc[vote.proposalId] = [];
+        }
+        acc[vote.proposalId].push(vote);
+        return acc;
+      },
+      {}
+    );
+
+    // 각 그룹 내에서 블록 번호로 정렬하고 순서 추가
+    const result = Object.entries(groupedVotes).map(([proposalId, votes]) => {
+      const sortedVotes = votes.sort((a, b) => b.blockNumber - a.blockNumber);
+      return {
+        proposalId: Number(proposalId),
+        title: votes[0].title,
+        votes: sortedVotes.map((vote, index) => ({
+          ...vote,
+          voteSequence: index + 1, // 투표 순서 (1: 최신, 2: 이전, 3: 그 이전...)
+        })),
+      };
+    });
+
+    // 전체 결과를 최신 투표 기준으로 정렬
+    const sortedResult = result.sort((a, b) => {
+      const aLatestVote = a.votes[0];
+      const bLatestVote = b.votes[0];
+      return bLatestVote.blockNumber - aLatestVote.blockNumber;
+    });
+
+    res.json(sortedResult);
   } catch (error) {
     console.error("Error fetching vote history:", error);
     res.status(500).json({ error: "Failed to fetch vote history" });
